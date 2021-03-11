@@ -1,0 +1,365 @@
+import asyncio
+import json
+import random
+from struct import pack, unpack
+import aiohttp
+import zlib
+import socket
+import configparser
+import os
+import asyncio
+import re
+
+tcp_server=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+host='127.0.0.1'
+port=9950
+tcp_server.bind((host,port))
+tcp_server.listen(10)
+
+class Bilibili:
+    wss_url = 'wss://broadcastlv.chat.bilibili.com/sub'
+    heartbeat = b'\x00\x00\x00\x1f\x00\x10\x00\x01\x00\x00\x00\x02\x00\x00\x00\x01\x5b\x6f\x62\x6a\x65\x63\x74\x20' \
+                b'\x4f\x62\x6a\x65\x63\x74\x5d '
+    heartbeatInterval = 60
+
+    @staticmethod
+    async def get_ws_info(url):
+        url = 'https://api.live.bilibili.com/room/v1/Room/room_init?id=' + url.split('/')[-1]
+        reg_datas = []
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                room_json = json.loads(await resp.text())
+                room_id = room_json['data']['room_id']
+                data = json.dumps({
+                    'roomid': room_id,
+                    'uid': int(1e14 + 2e14 * random.random()),
+                    'protover': 1
+                }, separators=(',', ':')).encode('ascii')
+                data = (pack('>i', len(data) + 16) + b'\x00\x10\x00\x01' +
+                        pack('>i', 7) + pack('>i', 1) + data)
+                reg_datas.append(data)
+
+        return Bilibili.wss_url, reg_datas
+
+    @staticmethod
+    def decode_msg(data):
+        dm_list_compressed = []
+        dm_list = []
+        ops = []
+        msgs = []
+        while True:
+            try:
+                packetLen, headerLen, ver, op, seq = unpack('!IHHII', data[0:16])
+            except Exception as e:
+                break
+            if len(data) < packetLen:
+                break
+            if ver == 1 or ver == 0:
+                ops.append(op)
+                dm_list.append(data[16:packetLen])
+            elif ver == 2:
+                dm_list_compressed.append(data[16:packetLen])
+            if len(data) == packetLen:
+                data = b''
+                break
+            else:
+                data = data[packetLen:]
+
+        for dm in dm_list_compressed:
+            d = zlib.decompress(dm)
+            while True:
+                try:
+                    packetLen, headerLen, ver, op, seq = unpack('!IHHII', d[0:16])
+                except Exception as e:
+                    break
+                if len(d) < packetLen:
+                    break
+                ops.append(op)
+                dm_list.append(d[16:packetLen])
+                if len(d) == packetLen:
+                    d = b''
+                    break
+                else:
+                    d = d[packetLen:]
+
+        for i, d in enumerate(dm_list):
+            try:
+                msg = {}
+                if ops[i] == 5:
+                    j = json.loads(d)
+                    msg['msg_type'] = {'SEND_GIFT': 'gift', 'DANMU_MSG': 'danmaku',
+                                       'WELCOME': 'enter', 'NOTICE_MSG': 'broadcast'}.get(j.get('cmd'), 'other')
+                    if msg['msg_type'] == 'danmaku':
+                        msg['name'] = (j.get('info', ['', '', ['', '']])[2][1]
+                                       or j.get('data', {}).get('uname', ''))
+                        msg['content'] = j.get('info', ['', ''])[1]
+                    elif msg['msg_type'] == 'broadcast':
+                        msg['type'] = j.get('msg_type', 0)
+                        msg['roomid'] = j.get('real_roomid', 0)
+                        msg['content'] = j.get('msg_common', 'none')
+                        msg['raw'] = j
+                    else:
+                        msg['content'] = j
+                else:
+                    msg = {'name': '', 'content': d, 'msg_type': 'other'}
+                msgs.append(msg)
+            except Exception as e:
+                pass
+
+        return msgs
+
+
+
+class DanmakuClient:
+    def __init__(self, url, q):
+        self.__url = ''
+        self.__site = None
+        self.__hs = None
+        self.__ws = None
+        self.__stop = False
+        self.__dm_queue = q
+        self.__link_status = True
+        if 'http://' == url[:7] or 'https://' == url[:8]:
+            self.__url = url
+        else:
+            self.__url = 'http://' + url
+        for u, s in {'live.bilibili.com': Bilibili}.items():
+            if re.match(r'^(?:http[s]?://)?.*?%s/(.+?)$' % u, url):
+                self.__site = s
+                self.__u = u
+                break
+        if self.__site is None:
+            print('Invalid link!')
+            exit()
+        self.__hs = aiohttp.ClientSession()
+
+    async def init_ws(self):
+        ws_url, reg_datas = await self.__site.get_ws_info(self.__url)
+        self.__ws = await self.__hs.ws_connect(ws_url)
+        if reg_datas:
+            for reg_data in reg_datas:
+                if self.__u == 'qf.56.com' or self.__u == 'laifeng.com' or self.__u == 'look.163.com':
+                    await self.__ws.send_str(reg_data)
+                else:
+                    await self.__ws.send_bytes(reg_data)
+
+    async def heartbeats(self):
+        while not self.__stop and self.__site.heartbeat:
+            await asyncio.sleep(self.__site.heartbeatInterval)
+            try:
+                if self.__u == 'qf.56.com' or self.__u == 'laifeng.com' or self.__u == 'look.163.com':
+                    await self.__ws.send_str(self.__site.heartbeat)
+                else:
+                    await self.__ws.send_bytes(self.__site.heartbeat)
+            except:
+                pass
+
+    async def fetch_danmaku(self):
+        while not self.__stop:
+            async for msg in self.__ws:
+                self.__link_status = True
+                ms = self.__site.decode_msg(msg.data)
+                for m in ms:
+                    await self.__dm_queue.put(m)
+            await asyncio.sleep(1)
+            await self.init_ws()
+            await asyncio.sleep(1)
+
+    async def init_ws_huajiao(self):
+        rid = re.search(r'\d+', self.__url).group(0)
+        s = self.__site(rid)
+        self.__ws = await self.__hs.ws_connect(self.__site.ws_url)
+        await self.__ws.send_bytes(s.sendHandshakePack())
+        count = 0
+        async for msg in self.__ws:
+            if count == 0:
+                await self.__ws.send_bytes(s.sendLoginPack(msg.data))
+            elif count == 1:
+                await self.__ws.send_bytes(s.sendJoinChatroomPack(msg.data))
+            elif count > 2:
+                ms = s.decode_msg(msg.data)
+                for m in ms:
+                    await self.__dm_queue.put(m)
+            count += 1
+
+    async def init_ws_acfun(self):
+        self.__ws = await self.__hs.ws_connect(self.__site.ws_url)
+        await self.__ws.send_bytes(self.__s.encode_packet('register'))
+
+    async def ping_acfun(self):
+        while True:
+            await asyncio.sleep(1)
+            await self.__ws.send_bytes(self.__s.encode_packet('ping'))
+
+    async def keepalive_acfun(self):
+        while True:
+            await asyncio.sleep(50)
+            await self.__ws.send_bytes(self.__s.encode_packet('keepalive'))
+
+    async def heartbeat_acfun(self):
+        while True:
+            await asyncio.sleep(10)
+            await self.__ws.send_bytes(self.__s.encode_packet('ztlivecsheartbeat'))
+
+    async def fetch_danmaku_acfun(self):
+        count = 0
+        async for msg in self.__ws:
+            self.__link_status = True
+            ms = self.__s.decode_packet(msg.data)
+            if count == 0:
+                await self.__ws.send_bytes(self.__s.encode_packet('ztlivecsenterroom'))
+                count += 1
+            for m in ms:
+                await self.__dm_queue.put(m)
+
+    async def init_ws_173(self):
+        self.__ws = await self.__hs.ws_connect(self.__site.ws_url)
+        await self.__ws.send_bytes(self.__s.pack('startup'))
+        await asyncio.sleep(1)
+        await self.__ws.send_bytes(self.__s.pack('enterroomreq'))
+
+    async def tcphelloreq_173(self):
+        while True:
+            await asyncio.sleep(10)
+            await self.__ws.send_bytes(self.__s.pack('tcphelloreq'))
+
+    async def roomhelloreq_173(self):
+        while True:
+            await asyncio.sleep(5)
+            await self.__ws.send_bytes(self.__s.pack('roomhelloreq'))
+
+    async def fetch_danmaku_173(self):
+        async for msg in self.__ws:
+            self.__link_status = True
+            ms = self.__s.unpack(msg.data)
+            for m in ms:
+                await self.__dm_queue.put(m)
+
+    async def init_ws_yy(self):
+        self.__ws = await self.__hs.ws_connect(self.__site.ws_url)
+        await self.__ws.send_bytes(self.__s.LoginUDB())
+
+    async def heartbeat_yy(self):
+        while True:
+            await asyncio.sleep(10)
+            await self.__ws.send_bytes(self.__s.pingAp())
+
+    async def fetch_danmaku_yy(self):
+        count = 0
+        async for msg in self.__ws:
+            self.__link_status = True
+            ms = self.__s.onProto(msg.data)
+            if count == 0:
+                await self.__ws.send_bytes(self.__s.loginAp())
+                await self.__ws.send_bytes(self.__s.joinServiceBc())
+                count += 1
+            for m in ms:
+                await self.__dm_queue.put(m)
+
+    async def start(self):
+        if self.__u == 'huajiao.com':
+            await self.init_ws_huajiao()
+        elif self.__u == 'acfun.cn':
+            rid = re.search(r'\d+', self.__url).group(0)
+            self.__s = self.__site(rid)
+            await self.init_ws_acfun()
+            await asyncio.gather(
+                self.ping_acfun(),
+                self.fetch_danmaku_acfun(),
+                self.keepalive_acfun(),
+                self.heartbeat_acfun(),
+            )
+        elif self.__u == '173.com':
+            rid = self.__url.split('/')[-1]
+            self.__s = self.__site(rid)
+            await self.init_ws_173()
+            await asyncio.gather(
+                self.fetch_danmaku_173(),
+                self.tcphelloreq_173(),
+                self.roomhelloreq_173(),
+            )
+        elif self.__u == 'yy.com':
+            rid = self.__url.split('/')[-1]
+            self.__s = self.__site(int(rid))
+            await self.init_ws_yy()
+            await asyncio.gather(
+                self.fetch_danmaku_yy(),
+                self.heartbeat_yy()
+            )
+        else:
+            await self.init_ws()
+            await asyncio.gather(
+                self.heartbeats(),
+                self.fetch_danmaku(),
+            )
+
+    async def stop(self):
+        self.__stop = True
+        await self.__hs.close()
+
+data={
+    "name":"",
+    "content":""
+}
+
+async def printer(q):
+    while True:
+        try:
+            client,addr=tcp_server.accept()
+            print(addr,"连接上了")
+            while True:
+                m = await q.get()
+                if m['msg_type'] == 'danmaku':
+                    data2=json.dumps(m,ensure_ascii=False)
+                    data["name"]=m['name']
+                    data["content"]=m['content']
+                    print(data)
+                    if client:
+                        client.send(bytes(data2,encoding=('utf8')))
+        except:
+            client.close()
+            print("close")
+
+
+
+async def main(url):
+    q = asyncio.Queue()
+    dmc = DanmakuClient(url, q)
+    asyncio.create_task(printer(q))
+    await dmc.start()
+
+cf=configparser.ConfigParser()
+configDir=os.path.dirname(os.path.realpath(__file__))
+print(configDir)
+configDir=configDir+'/config.ini'
+cf.read(configDir)
+secf=cf.sections()
+bilibili=cf.get('bilibili','id')
+bilibili='https://live.bilibili.com/'+bilibili
+print(bilibili)
+
+
+#a = input('请输入直播间地址：\n')
+#a='https://live.bilibili.com/9950825'
+a=bilibili
+asyncio.run(main(a))
+
+# 虎牙直播：https://www.huya.com/11352915
+# 斗鱼直播：https://www.douyu.com/85894
+# B站直播：https://live.bilibili.com/70155
+# 快手直播：https://live.kuaishou.com/u/jjworld126
+# 火猫直播：
+# 企鹅电竞：https://egame.qq.com/383204988
+# 花椒直播：https://www.huajiao.com/l/303344861?qd=hu
+# 映客直播：https://www.inke.cn/liveroom/index.html?uid=87493223&id=1593906372018299
+# CC直播：https://cc.163.com/363936598/
+# 酷狗直播：https://fanxing.kugou.com/1676290
+# 战旗直播：
+# 龙珠直播：http://star.longzhu.com/wsde135864219
+# PPS奇秀直播：https://x.pps.tv/room/208337
+# 搜狐千帆直播：https://qf.56.com/520208a
+# 来疯直播：https://v.laifeng.com/656428
+# LOOK直播：https://look.163.com/live?id=196257915
+# AcFun直播：https://live.acfun.cn/live/23682490
+# 艺气山直播：http://www.173.com/96
+
