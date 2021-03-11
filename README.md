@@ -5,14 +5,14 @@ python3.7
 windows  
 
 国内：  
-打开cmd命令行工具
-pip install --upgrade pip  
-pip install -i https://pypi.douban.com/simple/ -r requirestment.txt
+打开cmd命令行工具  
+pip install --upgrade pip    
+pip install -i https://pypi.douban.com/simple/ -r requirestment.txt  
 
-说明：  
-1，通过bilibili客户端，进入直播房间，点击主播获取主播房间号  
-2，修改配置文件里面id 后面的房间号
-3，运行python文件
+说明  ：    
+1，通过bilibili客户端，进入直播房间，点击主播获取主播房间号    
+2，修改配置文件里面id 后面的房间号  
+3，运行python文件  
 
 How to start :  
 1,cmd  
