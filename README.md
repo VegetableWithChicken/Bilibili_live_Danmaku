@@ -1,6 +1,9 @@
 # Bilibili_User_info.py 和Main_Run.py  
 都是独立的模块，可以单独运行，没有任何依赖关系
-
+Bilibili_User_info.py  
+可以获得 B站进入直播间用户信息，发送弹幕的内容，用户在这个直播间的等级，用户发送的小礼物信息，用户头像等  
+Main_Run.py   
+只能发送弹幕信息  
 ## Bilibili_live_Danmaku
 Get Bilibili live Danmaku and send message for TCP  
 [env]  
