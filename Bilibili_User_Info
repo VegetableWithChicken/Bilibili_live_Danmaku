@@ -1,0 +1,2539 @@
+
+#{'protocol_version': 0, 'datapack_type': 5, 'data': {'cmd': 'LIVE_INTERACTIVE_GAME', 'data': {'type': 2, 'uname': 'Vegetable_eat', 'gift_name': '', 'gift_num': 0, 'price': 0, 'msg': '来了'}}}
+import json
+import struct
+import asyncio
+import websockets
+import logging
+import zlib
+import base64
+import functools
+import datetime
+import re
+import time
+import os
+import socket
+import requests
+import configparser
+import urllib3
+import copy
+#uname,giftname,face
+#exceptions py
+
+class BilibiliApiException(Exception):
+    def __init__(self, msg):
+        self.msg = msg
+
+    def __str__(self):
+        return self.msg
+
+
+class NoPermissionException(BilibiliApiException):
+    def __init__(self, msg="无操作权限"):
+        self.msg = msg
+
+
+class BilibiliException(BilibiliApiException):
+    def __init__(self, code, msg):
+        self.code = code
+        self.msg = msg
+
+    def __str__(self):
+        return "错误代码：%s, 信息：%s" % (self.code, self.msg)
+
+
+class NetworkException(BilibiliApiException):
+    def __init__(self, code):
+        self.code = code
+
+    def __str__(self):
+        return "网络错误。状态码：%s" % self.code
+
+
+class NoIdException(BilibiliApiException):
+    def __init__(self):
+        self.msg = "aid和bvid请至少提供一个"
+
+
+class LiveException(BilibiliApiException):
+    def __init__(self, msg: str):
+        super().__init__(msg)
+
+class UploadException(BilibiliApiException):
+    def __init__(self, msg: str):
+        super().__init__(msg)
+
+#utils py
+
+request_settings = {
+    "use_https": True,
+    "proxies": None
+}
+urllib3.disable_warnings()
+
+DEFAULT_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Referer": "https://www.bilibili.com/"
+}
+
+MESSAGES = {
+    "no_sess": "需要提供：SESSDATA（Cookies里头的`SESSDATA`键对应的值）",
+    "no_csrf": "需要提供：csrf（Cookies里头的`bili_jct`键对应的值）"
+}
+
+
+def get_project_path():
+    return os.path.dirname(__file__)
+
+
+def get_api():
+    """
+    获取API
+    :return:
+    """
+    with open(os.path.join(os.path.dirname(__file__), "api.json"), "r", encoding="utf-8") as f:
+        apis = json.loads(f.read())
+        f.close()
+    return apis
+
+
+class Color(object):
+    def __init__(self, hex_: str = "FFFFFF"):
+        self.__color = 0
+        self.set_hex_color(hex_)
+
+    def set_hex_color(self, hex_color: str):
+        """
+        设置十六进制RGB颜色
+        :param hex_color:
+        :return:
+        """
+        if len(hex_color) == 3:
+            hex_color = "".join([x + "0" for x in hex_color])
+        dec = int(hex_color, 16)
+        self.__color = dec
+
+    def set_rgb_color(self, r: int, g: int, b: int):
+        """
+        根据RGB三个分量设置颜色
+        :param r: 红色分量
+        :param g: 绿色分量
+        :param b: 蓝色分量
+        :return:
+        """
+        if not all([0 <= r < 256, 0 <= g < 256, 0 <= b < 256]):
+            raise ValueError("值范围0~255")
+        self.__color = (r << 8*2) + (g << 8) + b
+
+    def set_dec_color(self, color: int):
+        """
+        设置十进制颜色
+        :param color:
+        :return:
+        """
+        if 0 <= int(color) <= 16777215:
+            self.__color = color
+        else:
+            raise ValueError("范围0~16777215")
+
+    def get_hex_color(self):
+        """
+        获取十六进制颜色
+        :return:
+        """
+        # 补零
+        h = hex(int(self.__color)).lstrip("0x")
+        h = "0" * (6 - len(h)) + h
+        return h
+
+    def get_rgb_color(self):
+        """
+        获取RGB三个分量颜色
+        :return:
+        """
+        h = hex(int(self.__color)).lstrip("0x")
+        # 补零
+        h = "0" * (6 - len(h)) + h
+        r = int(h[0:2], 16)
+        g = int(h[2:4], 16)
+        b = int(h[4:6], 16)
+        return r, g, b
+
+    def get_dec_color(self):
+        """
+        获取十进制颜色
+        :return:
+        """
+        return self.__color
+
+    def __str__(self):
+        return self.get_hex_color()
+
+
+_crack_uid = None
+
+
+class Danmaku(object):
+    FONT_SIZE_EXTREME_SMALL = 12
+    FONT_SIZE_SUPER_SMALL = 16
+    FONT_SIZE_SMALL = 18
+    FONT_SIZE_NORMAL = 25
+    FONT_SIZE_BIG = 36
+    FONT_SIZE_SUPER_BIG = 45
+    FONT_SIZE_EXTREME_BIG = 64
+    MODE_FLY = 1
+    MODE_TOP = 5
+    MODE_BOTTOM = 4
+    MODE_REVERSE = 6
+    TYPE_NORMAL = 0
+    TYPE_SUBTITLE = 1
+
+    def __init__(self, text: str, dm_time: float = 0.0, send_time: float = time.time(), crc32_id: str = None
+                 , color: Color = None, weight: int = -1, id_: int = -1, id_str: str = "", action: str = '',
+                 mode: int = MODE_FLY, font_size: int = FONT_SIZE_NORMAL, is_sub: bool = False, pool: int = -1,
+                 attr: int = -1):
+        self.dm_time = datetime.timedelta(seconds=dm_time)
+        self.send_time = datetime.datetime.fromtimestamp(send_time)
+        self.crc32_id = crc32_id
+        self.uid = None
+
+        self.color = color if color else Color()
+
+        self.mode = mode
+        self.font_size = font_size
+        self.is_sub = is_sub
+        self.text = text
+
+        self.weight = weight
+        self.id = id_
+        self.id_str = id_str
+        self.action = action
+        self.pool = pool
+        self.attr = attr
+
+    def __str__(self):
+        ret = "%s, %s, %s" % (self.send_time, self.dm_time, self.text)
+        return ret
+
+    def __len__(self):
+        return len(self.text)
+
+    def crack_uid(self):
+        """
+        暴力破解UID
+        :return:
+        """
+        global _crack_uid
+        if _crack_uid is None:
+            _crack_uid = CrackUid()
+        uid = _crack_uid(self.crc32_id)
+        self.uid = int(uid)
+        return self.uid
+
+
+class Verify(object):
+    def __init__(self, sessdata: str = None, csrf: str = None):
+        self.sessdata = sessdata
+        self.csrf = csrf
+
+    def get_cookies(self):
+        """
+        获取cookies
+        :return:
+        """
+        cookies = {}
+        if self.has_sess():
+            cookies["SESSDATA"] = self.sessdata
+        if self.has_csrf():
+            cookies["bili_jct"] = self.csrf
+        return cookies
+
+    def has_sess(self):
+        """
+        是否提供SESSDATA
+        :return:
+        """
+        if self.sessdata is None:
+            return False
+        else:
+            return True
+
+    def has_csrf(self):
+        """
+        是否提供CSRF
+        :return:
+        """
+        if self.csrf is None:
+            return False
+        else:
+            return True
+
+    def check(self):
+        """
+        检查权限情况
+        -1: csrf 校验失败
+        -2: SESSDATA值有误
+        -3: 未提供SESSDATA
+        :return:
+        """
+        ret = {
+            "code": -2,
+            "message": ""
+        }
+        if not self.has_sess():
+            ret["code"] = -3
+            ret["message"] = "未提供SESSDATA"
+        else:
+            api = "https://api.bilibili.com/x/web-interface/archive/like"
+            data = {"bvid": "BV1uv411q7Mv", "like": 1, "csrf": self.csrf}
+            req = requests.post(url=api, data=data, cookies=self.get_cookies())
+            if req.ok:
+                con = req.json()
+                if con["code"] == -111:
+                    ret["code"] = -1
+                    ret["message"] = "csrf 校验失败"
+                elif con["code"] == -101 or con["code"] == -400:
+                    ret["code"] = -2
+                    ret["message"] = "SESSDATA值有误"
+                else:
+                    ret["code"] = 0
+                    ret["message"] = "0"
+            else:
+                raise  NetworkException(req.status_code)
+        return ret
+
+
+class CrackUid(object):
+    """
+    弹幕中的CRC32 ID转换成用户UID
+    代码翻译自：https://github.com/esterTion/BiliBili_crc2mid
+    """
+    def __init__(self):
+        self.__CRCPOLYNOMIAL = 0xEDB88320
+        self.__crctable = [None] * 256
+        self.__create_table()
+        self.__index = [None] * 4
+
+    def __create_table(self):
+        for i in range(256):
+            crcreg = i
+            for j in range(8):
+                if (crcreg & 1) != 0:
+                    crcreg = self.__CRCPOLYNOMIAL ^ (crcreg >> 1)
+                else:
+                    crcreg >>= 1
+            self.__crctable[i] = crcreg
+
+    def __crc32(self, input_):
+        if type(input_) != str:
+            input_ = str(input_)
+        crcstart = 0xFFFFFFFF
+        len_ = len(input_)
+        for i in range(len_):
+            index = (crcstart ^ ord(input_[i])) & 0xFF
+            crcstart = (crcstart >> 8) ^ self.__crctable[index]
+        return crcstart
+
+    def __crc32lastindex(self, input_):
+        if type(input_) != str:
+            input_ = str(input_)
+        crcstart = 0xFFFFFFFF
+        len_ = len(input_)
+        index = None
+        for i in range(len_):
+            index = (crcstart ^ ord(input_[i])) & 0xFF
+            crcstart = (crcstart >> 8) ^ self.__crctable[index]
+        return index
+
+    def __getcrcindex(self, t):
+        for i in range(256):
+            if self.__crctable[i] >> 24 == t:
+                return i
+        return -1
+
+    def __deepCheck(self, i, index):
+        tc = 0x00
+        str_ = ""
+        hash_ = self.__crc32(i)
+        tc = hash_ & 0xFF ^ index[2]
+        if not (57 >= tc >= 48):
+            return [0]
+        str_ += str(tc - 48)
+        hash_ = self.__crctable[index[2]] ^ (hash_ >> 8)
+
+        tc = hash_ & 0xFF ^ index[1]
+        if not (57 >= tc >= 48):
+            return [0]
+        str_ += str(tc - 48)
+        hash_ = self.__crctable[index[1]] ^ (hash_ >> 8)
+
+        tc = hash_ & 0xFF ^ index[0]
+        if not (57 >= tc >= 48):
+            return [0]
+        str_ += str(tc - 48)
+        hash_ = self.__crctable[index[0]] ^ (hash_ >> 8)
+
+        return [1, str_]
+
+    def __call__(self, input_):
+        ht = int(input_, 16) ^ 0xFFFFFFFF
+        i = 3
+        while i >= 0:
+            self.__index[3-i] = self.__getcrcindex(ht >> (i*8))
+            snum = self.__crctable[self.__index[3-i]]
+            ht ^= snum >> ((3-i)*8)
+            i -= 1
+        for i in range(10000000):
+            lastindex = self.__crc32lastindex(i)
+            if lastindex == self.__index[3]:
+                deepCheckData = self.__deepCheck(i, self.__index)
+                if deepCheckData[0]:
+                    break
+        if i == 10000000:
+            return -1
+        return str(i) + deepCheckData[1]
+
+# 请求相关
+
+
+def request(method: str, url: str, params=None, data=None, cookies=None, headers=None, data_type: str = "form", **kwargs):
+    if params is None:
+        params = {}
+    if data is None:
+        data = {}
+    if cookies is None:
+        cookies = {}
+    if headers is None:
+        headers = copy.deepcopy(DEFAULT_HEADERS)
+    if data_type.lower() == "json":
+        headers['Content-Type'] = "application/json"
+    st = {
+        "url": url,
+        "params": params,
+        "headers": headers,
+        "verify": request_settings["use_https"],
+        "data": data,
+        "proxies": request_settings["proxies"],
+        "cookies": cookies
+    }
+    st.update(kwargs)
+
+    req = requests.request(method, **st)
+    if req.ok:
+        content = req.content.decode("utf8")
+        if req.headers.get("content-length") == 0:
+            return None
+        if 'jsonp' in params and 'callback' in params:
+            con = json.loads(re.match(".*?({.*}).*", content, re.S).group(1))
+        else:
+            con = json.loads(content)
+        if con["code"] != 0:
+            if "message" in con:
+                msg = con["message"]
+            elif "msg" in con:
+                msg = con["msg"]
+            else:
+                msg = "请求失败，服务器未返回失败原因"
+            raise  BilibiliException(con["code"], msg)
+        else:
+            if 'data' in con.keys():
+                return con['data']
+            else:
+                if 'result' in con.keys():
+                    return con["result"]
+                else:
+                    return None
+    else:
+        raise  NetworkException(req.status_code)
+
+
+def get(url, params=None, cookies=None, headers=None, data_type: str = "form", **kwargs):
+    """
+    专用GET请求
+    :param data_type:
+    :param url:
+    :param params:
+    :param cookies:
+    :param headers:
+    :param kwargs:
+    :return:
+    """
+    resp = request("GET", url=url, params=params, cookies=cookies, headers=headers, data_type=data_type, **kwargs)
+    return resp
+
+
+def post(url, cookies, data=None, headers=None, data_type: str = "form", **kwargs):
+    """
+    专用POST请求
+    :param data_type:
+    :param url:
+    :param cookies:
+    :param data:
+    :param headers:
+    :param kwargs:
+    :return:
+    """
+    resp = request("POST", url=url, data=data, cookies=cookies, headers=headers, data_type=data_type, **kwargs)
+    return resp
+
+
+def delete(url, params=None, data=None, cookies=None, headers=None, data_type: str = "form", **kwargs):
+    """
+    专用DELETE请求
+    :param data_type:
+    :param url:
+    :param params:
+    :param data:
+    :param cookies:
+    :param headers:
+    :param kwargs:
+    :return:
+    """
+    resp = request("DELETE", url=url, params=params, data=data, cookies=cookies, headers=headers, data_type=data_type, **kwargs)
+    return resp
+
+
+def bvid2aid(bvid: str):
+    """
+    BV号转AV号
+    代码来源：https://www.zhihu.com/question/381784377/answer/1099438784
+    :param bvid:
+    :return:
+    """
+    table = 'fZodR9XQDSUm21yCkr6zBqiveYah8bt4xsWpHnJE7jL5VG3guMTKNPAwcF'
+    tr = {}
+    for i in range(58):
+        tr[table[i]] = i
+    s = [11, 10, 3, 8, 4, 6]
+    xor = 177451812
+    add = 8728348608
+
+    def dec(x):
+        r = 0
+        for i in range(6):
+            r += tr[x[s[i]]] * 58 ** i
+        return (r - add) ^ xor
+
+    return dec(bvid)
+
+
+def aid2bvid(aid: int):
+    """
+    AV号转BV号
+    代码来源：https://www.zhihu.com/question/381784377/answer/1099438784
+    :param aid:
+    :return:
+    """
+    table = 'fZodR9XQDSUm21yCkr6zBqiveYah8bt4xsWpHnJE7jL5VG3guMTKNPAwcF'
+    tr = {}
+    for i in range(58):
+        tr[table[i]] = i
+    s = [11, 10, 3, 8, 4, 6]
+    xor = 177451812
+    add = 8728348608
+
+    def enc(x):
+        x = (x ^ xor) + add
+        r = list('BV1  4 1 7  ')
+        for i in range(6):
+            r[s[i]] = table[x // 58 ** i % 58]
+        return ''.join(r)
+
+    return enc(aid)
+
+
+def upload_image(image_path: str, verify: Verify):
+    """
+    上传图片
+    :param verify:
+    :param image_path: 图片路径列表
+    :return:
+    """
+    if not verify.has_sess():
+        raise  NoPermissionException(MESSAGES["no_sess"])
+
+    api = get_api()["dynamic"]["send"]["upload_img"]
+    data = {
+        "biz": "draw",
+        "category": "daily"
+    }
+    files = {
+        "file_up": open(image_path, "rb")
+    }
+    resp = post(url=api["url"], data=data, cookies=verify.get_cookies(), files=files)
+    return resp
+
+
+def read_varint(stream: bytes):
+    """
+    读取varint
+    :param stream:
+    :return: value（真实值）, length（varint长度）
+    """
+    value = 0
+    position = 0
+    shift = 0
+    while True:
+        if position >= len(stream):
+            break
+        byte = stream[position]
+        value += (byte & 0b01111111) << shift
+        if byte & 0b10000000 == 0:
+            break
+        position += 1
+        shift += 7
+    return value, position + 1
+
+#py
+
+API =  get_api()
+
+
+def get_user_info(uid: int, verify:  Verify = None):
+    """
+    获取用户信息（昵称，性别，生日，签名，头像URL，空间横幅URL等）
+    :param uid:
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify =  Verify()
+
+    api = API["user"]["info"]["info"]
+    params = {
+        "mid": uid
+    }
+    data =  get(url=api["url"], params=params, cookies=verify.get_cookies())
+    return data
+
+
+def get_self_info(verify:  Verify = None):
+    if verify is None:
+        verify =  Verify()
+    if not verify.has_sess():
+        raise  NoPermissionException("需要验证：SESSDATA")
+    url = "https://api.bilibili.com/x/web-interface/nav"
+    resp =  get(url, cookies=verify.get_cookies())
+    return resp
+
+
+def get_relation_info(uid: int, verify:  Verify = None):
+    """
+    获取用户关系信息（关注数，粉丝数，悄悄关注，黑名单数）
+    B站API太乱了。。。
+    :param uid:
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify =  Verify()
+
+    api = API["user"]["info"]["relation"]
+    params = {
+        "vmid": uid
+    }
+    data =  get(url=api["url"], params=params, cookies=verify.get_cookies())
+    return data
+
+
+def get_up_info(uid: int, verify:  Verify = None):
+    """
+    获取UP主数据信息（视频总播放量，文章总阅读量，总点赞数）
+    B站API太乱了。。。
+    :param uid:
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify =  Verify()
+    if not verify.has_sess():
+        raise  NoPermissionException( MESSAGES["no_sess"])
+
+    api = API["user"]["info"]["upstat"]
+    params = {
+        "mid": uid
+    }
+    data =  get(url=api["url"], params=params, cookies=verify.get_cookies())
+    return data
+
+
+def get_live_info(uid: int, verify:  Verify = None):
+    """
+    获取用户直播间信息
+    :param uid:
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify =  Verify()
+
+    api = API["user"]["info"]["live"]
+    params = {
+        "mid": uid
+    }
+    data =  get(url=api["url"], params=params, cookies=verify.get_cookies())
+    return data
+
+
+def get_videos_g(uid: int, order: str = "pubdate", verify:  Verify = None):
+    """
+    自动循环获取用户投稿视频信息
+    :param uid:
+    :param order: 排序，接受"pubdate", "view", "favorite"
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify =  Verify()
+
+    page = 1
+    while True:
+        data = get_videos_raw(uid=uid, order=order, pn=page, verify=verify)
+        if not data["list"]["vlist"]:
+            break
+        for v in data["list"]["vlist"]:
+            yield v
+        page += 1
+
+
+def get_videos_raw(uid: int, ps: int = 30, tid: int = 0, pn: int = 1, keyword: str = "",
+                   order: str = "pubdate", verify:  Verify = None):
+    """
+    低层级API，获取视频信息API的原始返回
+    :param uid:
+    :param ps: 每页最多几个视频，保持默认30即可
+    :param tid: 分区ID
+    :param pn: 第几页，从1开始
+    :param keyword: 搜索关键词
+    :param order: 排序，接受"pubdate", "view", "favorite"
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify =  Verify()
+    ORDER_MAP = {
+        "pubdate": "pubdate",
+        "view": "click",
+        "favorite": "stow"
+    }
+    if order not in ORDER_MAP:
+        raise  BilibiliApiException("排序方式无效，可用值：pubdate（上传日期）、view（播放量）、favorite（收藏量）")
+
+    api = API["user"]["info"]["video"]
+    params = {
+        "mid": uid,
+        "ps": ps,
+        "tid": tid,
+        "pn": pn,
+        "keyword": keyword,
+        "order": ORDER_MAP[order]
+    }
+    data =  get(url=api["url"], params=params, cookies=verify.get_cookies())
+    return data
+
+
+def get_audios_g(uid: int, order: str = "pubdate", verify:  Verify = None):
+    """
+    获取用户音频投稿
+    :param uid:
+    :param order: 排序，接受"pubdate", "view", "favorite"
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify =  Verify()
+
+    page = 1
+    while True:
+        data = get_audios_raw(uid=uid, order=order, pn=page, verify=verify)
+        if not data["data"]:
+            break
+        for au in data["data"]:
+            yield au
+        page += 1
+
+
+def get_audios_raw(uid: int, order: str = "pubdate", ps: int = 30,
+                   pn: int = 1, verify:  Verify = None):
+    """
+    低层级API，获取用户音频投稿API原始返回
+    :param uid:
+    :param order:
+    :param ps:
+    :param pn:
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify =  Verify()
+    ORDER_MAP = {
+        "pubdate": 1,
+        "view": 2,
+        "favorite": 3
+    }
+    if order not in ORDER_MAP:
+        raise  BilibiliApiException("排序方式无效，可用值：pubdate（上传日期）、view（播放量）、favorite（收藏量）")
+    api = API["user"]["info"]["audio"]
+    params = {
+        "uid": uid,
+        "ps": ps,
+        "pn": pn,
+        "order": ORDER_MAP[order]
+    }
+    data =  get(url=api["url"], params=params, cookies=verify.get_cookies())
+    return data
+
+
+def get_articles_g(uid: int, order: str = "pubdate", verify:  Verify = None):
+    """
+    自动循环获取专栏投稿
+    :param uid:
+    :param order: 排序方式，pubdate（上传日期）、view（播放量）、favorite（收藏量）
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify =  Verify()
+
+    page = 1
+    while True:
+        data = get_articles_raw(uid=uid, order=order, verify=verify, pn=page)
+        if "articles" not in data:
+            break
+        else:
+            for ar in data["articles"]:
+                yield ar
+            page += 1
+
+
+def get_articles_raw(uid: int, pn: int = 1, ps: int = 30, order: str = "pubdate", verify:  Verify = None):
+    """
+    低层级API，获取专栏投稿API原始返回
+    :param ps: 一页多少，保持30默认即可
+    :param pn: 页码
+    :param uid:
+    :param order: 排序方式，pubdate（上传日期）、view（播放量）、favorite（收藏量）
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify =  Verify()
+
+    ORDER_MAP = {
+        "pubdate": "publish_time",
+        "view": "view",
+        "favorite": "fav"
+    }
+    if order not in ORDER_MAP:
+        raise  BilibiliApiException("排序方式无效，可用值：pubdate（上传日期）、view（播放量）、favorite（收藏量）")
+
+    api = API["user"]["info"]["article"]
+    params = {
+        "mid": uid,
+        "ps": ps,
+        "pn": pn,
+        "sort": ORDER_MAP[order]
+    }
+    data =  get(url=api["url"], params=params, cookies=verify.get_cookies())
+    return data
+
+
+def get_article_list(uid: int, order: str = "latest", verify:  Verify = None):
+    """
+    获取专栏文集
+    :param uid:
+    :param order: 排序方式，接受 "latest"（最近更新），"view"（最多阅读）
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify =  Verify()
+    ORDER_MAP = {
+        "latest": 0,
+        "view": 1
+    }
+    if order not in ORDER_MAP:
+        raise  BilibiliApiException("排序方式无效，可用值：\"latest\"（最近更新），\"view\"（最多阅读）")
+
+    api = API["user"]["info"]["article_lists"]
+    params = {
+        "mid": uid,
+        "sort": ORDER_MAP[order]
+    }
+    data =  get(url=api["url"], params=params, cookies=verify.get_cookies())
+    return data
+
+
+def get_dynamic_raw(uid: int, offset: str = 0, need_top: bool = False, verify:  Verify = None):
+    if verify is None:
+        verify =  Verify()
+    api = API["user"]["info"]["dynamic"]
+    params = {
+        "host_uid": uid,
+        "offset_dynamic_id": offset,
+        "need_top": 1 if need_top else 0
+    }
+    data =  get(url=api["url"], params=params, cookies=verify.get_cookies())
+    if data['has_more'] != 1:
+        return data
+    for card in data["cards"]:
+        card["card"] = json.loads(card["card"])
+        card["extend_json"] = json.loads(card["extend_json"])
+
+    return data
+
+
+def get_dynamic_g(uid: int, verify:  Verify = None):
+    """
+    自动循环获取用户动态
+    :param uid:
+    :param verify:
+    :return:
+    """
+
+    offset = "0"
+    while True:
+        data = get_dynamic_raw(uid, offset, verify=verify)
+        if 'cards' not in data:
+            break
+        for c in data["cards"]:
+            yield c
+        if data["has_more"] != 1:
+            break
+        offset = data["next_offset"]
+
+
+def get_bangumi_g(uid: int, type_: str = "bangumi", verify:  Verify = None):
+    """
+    自动循环获取追番/追剧列表
+    :param uid:
+    :param type_:
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify =  Verify()
+
+    page = 1
+    while True:
+        data = get_bangumi_raw(uid=uid, pn=page, type_=type_, verify=verify)
+        if len(data["list"]) == 0:
+            break
+        for b in data["list"]:
+            yield b
+        page += 1
+
+
+def get_bangumi_raw(uid: int, pn: int = 1, ps: int = 15, type_: str = "bangumi", verify:  Verify = None):
+    """
+    低层级API，获取追番/追剧列表原始API返回
+    :param uid:
+    :param pn: 页码
+    :param ps: 每页多少，保持默认15
+    :param type_: 类型：bangumi（番剧），drama（追剧）
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify =  Verify()
+    TYPE_MAP = {
+        "bangumi": 1,
+        "drama": 2
+    }
+    if type_ not in TYPE_MAP:
+        raise  BilibiliApiException("type_类型错误。接受：bangumi（番剧），drama（追剧）")
+
+    api = API["user"]["info"]["bangumi"]
+    params = {
+        "vmid": uid,
+        "pn": pn,
+        "ps": ps,
+        "type": TYPE_MAP[type_]
+    }
+    data =  get(url=api["url"], params=params, cookies=verify.get_cookies())
+    return data
+
+
+def get_favorite_list_content_raw(media_id: int, pn: int = 1, ps: int = 20, keyword: str = "",
+                                  order: str = "mtime", type_: int = 0, tid: int = 0, verify:  Verify = None):
+    """
+    获取收藏夹内容
+    :param media_id: 收藏夹id
+    :param pn:
+    :param ps:
+    :param keyword: 搜索关键词
+    :param order: 排序依据。mtime最近收藏，view最多播放，pubtime最新投稿
+    :param type_:
+    :param tid: 分区ID，0为全部
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify =  Verify()
+
+    api = API["common"]["favorite"]["get_favorite_list_content"]
+    params = {
+        "media_id": media_id,
+        "pn": pn,
+        "ps": ps,
+        "keyword": keyword,
+        "order": order,
+        "type": type_,
+        "tid": tid
+    }
+    data =  get(url=api["url"], params=params, cookies=verify.get_cookies())
+    return data
+
+
+def get_favorite_list_content_g(media_id: int, order: str = "mtime", verify:  Verify = None):
+    """
+    自动循环获取收藏夹内容
+    :param media_id: 收藏夹分类ID
+    :param order: 排序方式，接受值：mtime（最近收藏）、view（最多播放）、pubtime（最近投稿）
+    :param verify:
+    :return:
+    """
+    page = 1
+    while True:
+        data = get_favorite_list_content_raw(media_id=media_id, order=order, pn=page, verify=verify)
+        if "medias" not in data:
+            break
+        if data["medias"] is None:
+            break
+        for m in data["medias"]:
+            yield m
+        page += 1
+
+
+def get_favorite_list(uid: int, verify:  Verify = None):
+    """
+    获取收藏夹列表
+    :param uid:
+    :param verify:
+    :return:
+    """
+    resp = get_favorite_list(uid, verify=verify)
+    return resp
+
+
+def get_followings_raw(uid: int, ps: int = 20, pn: int = 1, order: str = "desc", verify:  Verify = None):
+    """
+    低层级API,获取用户关注列表（不是自己只能访问前5页）
+    :param order: desc倒序,asc正序
+    :param pn: 页码
+    :param ps: 每页数量
+    :param uid:
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify =  Verify()
+    assert order in ("desc", "asc"),  BilibiliApiException("不支持的排序方式")
+
+    api = API["user"]["info"]["followings"]
+    params = {
+        "vmid": uid,
+        "ps": ps,
+        "pn": pn,
+        "order": order
+    }
+    data =  get(url=api["url"], params=params, cookies=verify.get_cookies())
+    return data
+
+
+def get_followings_g(uid: int, order: str = "desc", verify:  Verify = None):
+    """
+    获取用户关注列表
+    :param uid:
+    :param order: desc倒序,asc正序
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify =  Verify()
+
+    page = 1
+    while True:
+        try:
+            data = get_followings_raw(uid=uid, order=order, pn=page, verify=verify)
+        except  BilibiliException as e:
+            if e.code == 22007:
+                break
+            else:
+                raise e
+        if len(data["list"]) == 0:
+            break
+        for f in data["list"]:
+            yield f
+        page += 1
+
+
+def get_followers_raw(uid: int, ps: int = 20, pn: int = 1, order: str = "desc", verify:  Verify = None):
+    """
+    低层级API,获取用户粉丝列表（不是自己只能访问前5页，是自己也不能获取全部的样子）
+    :param order: desc倒序,asc正序
+    :param pn: 页码
+    :param ps: 每页数量
+    :param uid:
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify =  Verify()
+    assert order in ("desc", "asc"),  BilibiliApiException("不支持的排序方式")
+
+    api = API["user"]["info"]["followers"]
+    params = {
+        "vmid": uid,
+        "ps": ps,
+        "pn": pn,
+        "order": order
+    }
+    data =  get(url=api["url"], params=params, cookies=verify.get_cookies())
+    return data
+
+
+def get_followers_g(uid: int, order: str = "desc", verify:  Verify = None):
+    """
+    获取用户粉丝列表（不是自己只能访问前5页，是自己也不能获取全部的样子）
+    :param uid:
+    :param order: desc倒序,asc正序
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify =  Verify()
+
+    page = 1
+    while True:
+        try:
+            data = get_followers_raw(uid=uid, order=order, pn=page, verify=verify)
+        except  BilibiliException as e:
+            if e.code == 22007:
+                break
+            else:
+                raise e
+        if len(data["list"]) == 0:
+            break
+        for f in data["list"]:
+            yield f
+        page += 1
+
+
+def get_overview(uid: int, verify:  Verify = None):
+    """
+    获取用户的简易订阅和投稿信息
+    :param uid:
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify =  Verify()
+    api = API["user"]["info"]["overview"]
+    params = {
+        "mid": uid,
+        "jsonp": "jsonp",
+        "callback": "__jp8"
+    }
+    data =  get(url=api["url"], params=params, cookies=verify.get_cookies())
+    return data
+
+
+# 操作用户
+
+
+def set_subscribe(uid: int, status: bool = True, whisper: bool = False, verify:  Verify = None):
+    """
+    设置用户关注状态
+    :param whisper: 设置关注时是否为悄悄关注
+    :param uid:
+    :param status: 状态，True or False
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify =  Verify()
+    if not verify.has_sess():
+        raise  NoPermissionException( MESSAGES["no_sess"])
+    if not verify.has_csrf():
+        raise  NoPermissionException( MESSAGES["no_csrf"])
+
+    api = API["user"]["operate"]["modify"]
+    data = {
+        "fid": uid,
+        "act": 1 if status else 2,
+        "re_src": 11,
+        "csrf": verify.csrf
+    }
+    if status and whisper:
+        data["act"] = 3
+    data =  post(url=api["url"], data=data, cookies=verify.get_cookies())
+    return data
+
+
+def set_black(uid: int, status: bool = True, verify:  Verify = None):
+    """
+    设置用户拉黑状态
+    :param uid:
+    :param status: 状态，True or False
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify =  Verify()
+    if not verify.has_sess():
+        raise  NoPermissionException( MESSAGES["no_sess"])
+    if not verify.has_csrf():
+        raise  NoPermissionException( MESSAGES["no_csrf"])
+
+    api = API["user"]["operate"]["modify"]
+    data = {
+        "fid": uid,
+        "act": 5 if status else 6,
+        "re_src": 11,
+        "csrf": verify.csrf
+    }
+    data =  post(url=api["url"], data=data, cookies=verify.get_cookies())
+    return data
+
+
+def remove_fans(uid: int, verify:  Verify = None):
+    """
+    移除粉丝
+    :param uid:
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify =  Verify()
+    if not verify.has_sess():
+        raise  NoPermissionException( MESSAGES["no_sess"])
+    if not verify.has_csrf():
+        raise  NoPermissionException( MESSAGES["no_csrf"])
+
+    api = API["user"]["operate"]["modify"]
+    data = {
+        "fid": uid,
+        "act": 7,
+        "re_src": 11,
+        "csrf": verify.csrf
+    }
+    data =  post(url=api["url"], data=data, cookies=verify.get_cookies())
+    return data
+
+
+def send_msg(uid: int, text: str, self_uid: int = None, verify:  Verify = None):
+    """
+    给用户发送私聊信息
+    :param uid:
+    :param text: 内容
+    :param self_uid: 自己的UID，若不提供将自动获取
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify =  Verify()
+    if not verify.has_sess():
+        raise  NoPermissionException( MESSAGES["no_sess"])
+    if not verify.has_csrf():
+        raise  NoPermissionException( MESSAGES["no_csrf"])
+
+    api = API["user"]["operate"]["send_msg"]
+    if self_uid is None:
+        self_info = get_self_info(verify)
+        sender_uid = self_info["mid"]
+    else:
+        sender_uid = self_uid
+    data = {
+        "msg[sender_uid]": sender_uid,
+        "msg[receiver_id]": uid,
+        "msg[receiver_type]": 1,
+        "msg[msg_type]": 1,
+        "msg[msg_status]": 0,
+        "msg[content]": json.dumps({"content": text}),
+        "msg[dev_id]": "1369CA35-1771-4B80-B6D4-D7EB975B7F8A",
+        "msg[new_face_version]": "0",
+        "msg[timestamp]": int(time.time()),
+        "csrf_token": verify.csrf,
+        "csrf": verify.csrf
+    }
+    data =  post(url=api["url"], data=data, cookies=verify.get_cookies())
+    return data
+
+# 分组操作
+
+
+def get_self_subscribe_group(verify:  Verify):
+    """
+    获取自己的关注分组列表
+    :param verify:
+    :return:
+    """
+    if not verify.has_sess():
+        raise  NoPermissionException( MESSAGES["no_sess"])
+
+    api = API["user"]["info"]["self_subscribe_group"]
+    resp =  get(api["url"], cookies=verify.get_cookies())
+    return resp
+
+
+def get_user_in_which_subscribe_groups(uid: int, verify:  Verify):
+    """
+    获取用户在哪些关注分组列表
+    :param uid:
+    :param verify:
+    :return:
+    """
+    if not verify.has_sess():
+        raise  NoPermissionException( MESSAGES["no_sess"])
+
+    api = API["user"]["info"]["get_user_in_which_subscribe_groups"]
+    params = {
+        "fid": uid
+    }
+    resp =  get(api["url"], params=params, cookies=verify.get_cookies())
+    return resp
+
+
+def add_subscribe_group(name: str, verify:  Verify):
+    """
+    添加关注分组
+    :param name: 分组名
+    :param verify:
+    :return:
+    """
+    if not verify.has_sess():
+        raise  NoPermissionException( MESSAGES["no_sess"])
+    if not verify.has_csrf():
+        raise  NoPermissionException( MESSAGES["no_csrf"])
+
+    api = API["user"]["operate"]["add_subscribe_group"]
+    payload = {
+        "tag": name,
+        "csrf": verify.csrf
+    }
+    resp =  post(api["url"], data=payload, cookies=verify.get_cookies())
+    return resp
+
+
+def del_subscribe_group(group_id: int, verify:  Verify):
+    """
+    删除关注分组
+    :param group_id: 分组ID
+    :param verify:
+    :return:
+    """
+    if not verify.has_sess():
+        raise  NoPermissionException( MESSAGES["no_sess"])
+    if not verify.has_csrf():
+        raise  NoPermissionException( MESSAGES["no_csrf"])
+
+    api = API["user"]["operate"]["del_subscribe_group"]
+    payload = {
+        "tagid": group_id,
+        "csrf": verify.csrf
+    }
+    resp =  post(api["url"], data=payload, cookies=verify.get_cookies())
+    return resp
+
+
+def rename_subscribe_group(group_id: int, new_name: str, verify:  Verify):
+    """
+    重命名关注分组
+    :param new_name: 新的分组名
+    :param group_id: 分组ID
+    :param verify:
+    :return:
+    """
+    if not verify.has_sess():
+        raise  NoPermissionException( MESSAGES["no_sess"])
+    if not verify.has_csrf():
+        raise  NoPermissionException( MESSAGES["no_csrf"])
+
+    api = API["user"]["operate"]["rename_subscribe_group"]
+    payload = {
+        "tagid": group_id,
+        "name": new_name,
+        "csrf": verify.csrf
+    }
+    resp =  post(api["url"], data=payload, cookies=verify.get_cookies())
+    return resp
+
+
+def move_user_subscribe_group(uid: int, group_ids: list, verify:  Verify):
+    """
+    移动用户到特定的关注分组
+    :param uid:
+    :param group_ids: 分组id列表，为空时移动到默认分组
+    :param verify:
+    :return:
+    """
+    if not verify.has_sess():
+        raise NoPermissionException(MESSAGES["no_sess"])
+    if not verify.has_csrf():
+        raise NoPermissionException( MESSAGES["no_csrf"])
+
+    api = API["user"]["operate"]["move_user_subscribe_group"]
+    payload = {
+        "fids": uid,
+        "tagids": ",".join(list(map(lambda x: str(x), group_ids))) if len(group_ids) != 0 else "0",
+        "csrf": verify.csrf
+    }
+    resp =  post(api["url"], data=payload, cookies=verify.get_cookies())
+    return resp
+#common py
+
+COMMENT_TYPE_MAP = {
+    "video": 1,
+    "article": 12,
+    "dynamic_draw": 11,
+    "dynamic_text": 17,
+    "audio": 14,
+    "audio_list": 19
+}
+COMMENT_SORT_MAP = {
+    "like": 2,
+    "time": 0
+}
+
+
+def send_comment(text: str, oid: int, type_: str, root: int = None,
+                 parent: int = None, verify: Verify = None):
+    """
+    通用发送评论
+    :param text:
+    :param oid:
+    :param type_:
+    :param root:
+    :param parent:
+    :param verify:
+    :return:
+    """
+
+    if verify is None:
+        raise BilibiliApiException("请提供verify")
+    if not verify.has_sess():
+        raise NoPermissionException(MESSAGES["no_sess"])
+    if not verify.has_csrf():
+        raise NoPermissionException(MESSAGES["no_csrf"])
+
+    type_ = COMMENT_TYPE_MAP.get(type_, None)
+    if type_ is None:
+        BilibiliApiException("不支持的评论类型")
+
+    # 参数检查完毕
+    data = {
+        "oid": oid,
+        "type": type_,
+        "message": text,
+        "plat": 1,
+        "csrf": verify.csrf
+    }
+    if parent is not None and root is None:
+        # 直接回复媒体
+        data["root"] = oid
+        data["parent"] = parent
+    elif parent is None and root is not None:
+        # 回复动态下面的评论
+        data["root"] = root
+        data["parent"] = root
+    elif parent is not None and root is not None:
+        # 根据用户设置
+        data["root"] = root
+        data["parent"] = parent
+
+    api = API["common"]["comment"]["send"]
+    resp = post(api["url"], data=data, cookies=verify.get_cookies())
+    return resp
+
+
+def operate_comment(action: str, oid: int, type_: str, rpid: int,
+                    status: bool = True, verify: Verify = None):
+    """
+    通用评论操作
+    :param action: 操作类型，见api.json
+    :param oid:
+    :param type_:
+    :param rpid:
+    :param status: 设置状态
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        raise BilibiliApiException("请提供verify")
+    if not verify.has_sess():
+        raise NoPermissionException(MESSAGES["no_sess"])
+    if not verify.has_csrf():
+        raise NoPermissionException(MESSAGES["no_csrf"])
+
+    type_ = COMMENT_TYPE_MAP.get(type_, None)
+    assert type_ is not None, BilibiliApiException("不支持的评论类型")
+
+    comment_api = API["common"]["comment"]
+    api = comment_api.get(action, None)
+    assert api is not None, BilibiliApiException("不支持的评论操作方式")
+    # 参数检查完毕
+    data = {
+        "oid": oid,
+        "type": type_,
+        "rpid": rpid,
+        "csrf": verify.csrf
+    }
+    if action != "del":
+        data["action"] = 1 if status else 0
+
+    resp = post(api["url"], cookies=verify.get_cookies(), data=data)
+    return resp
+
+
+def get_comments_raw(oid: int, type_: str, order: str = "time", pn: int = 1, verify: Verify = None):
+    """
+    通用获取评论
+    :param oid:
+    :param type_:
+    :param order:
+    :param pn:
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify = Verify()
+
+    type_ = COMMENT_TYPE_MAP.get(type_, None)
+    assert type_ is not None, BilibiliApiException("不支持的评论类型")
+
+    order = COMMENT_SORT_MAP.get(order, None)
+    assert order is not None, BilibiliApiException("不支持的排序方式，支持：time（时间倒序），like（热度倒序）")
+    # 参数检查完毕
+    params = {
+        "oid": oid,
+        "type": type_,
+        "sort": order,
+        "pn": pn
+    }
+    comment_api = API["common"]["comment"]
+    api = comment_api.get("get", None)
+    resp = get(api["url"], params=params, cookies=verify.get_cookies())
+    return resp
+
+
+def get_comments(oid: int, type_: str, order: str = "time", verify: Verify = None):
+    """
+    通用循环获取评论，使用生成器语法
+    :param type_:
+    :param order:
+    :param oid:
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify = Verify()
+
+    page = 1
+    while True:
+        resp = get_comments_raw(oid=oid, pn=page, order=order, verify=verify, type_=type_)
+        if "replies" not in resp:
+            break
+        if resp["replies"] is None:
+            break
+        for rep in resp["replies"]:
+            yield rep
+        page += 1
+
+
+def get_sub_comments_raw(oid: int, type_: str, root: int, ps: int = 10, pn: int = 1, verify: Verify = None):
+    """
+    通用获取子评论
+    :param ps:
+    :param root:
+    :param oid:
+    :param type_:
+    :param pn:
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify = Verify()
+
+    type_ = COMMENT_TYPE_MAP.get(type_, None)
+    assert type_ is not None, BilibiliApiException("不支持的评论类型")
+
+    # 参数检查完毕
+    params = {
+        "oid": oid,
+        "type": type_,
+        "ps": ps,
+        "pn": pn,
+        "root": root
+    }
+    comment_api = API["common"]["comment"]
+    api = comment_api.get("sub_reply", None)
+    resp = get(api["url"], params=params, cookies=verify.get_cookies())
+    return resp
+
+
+def get_sub_comments(oid: int, type_: str, root: int, ps: int = 10, verify: Verify = None):
+    """
+    通用循环获取子评论，使用生成器语法
+    :param ps:
+    :param root:
+    :param type_:
+    :param oid:
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify = Verify()
+
+    page = 1
+    while True:
+        resp = get_sub_comments_raw(oid=oid, pn=page, root=root, ps=ps, verify=verify, type_=type_)
+        if "replies" not in resp:
+            break
+        if resp["replies"] is None:
+            break
+        for rep in resp["replies"]:
+            yield rep
+        page += 1
+
+
+def get_vote_info(vote_id: int, verify: Verify = None):
+    """
+    获取投票信息
+    :param vote_id:
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify = Verify()
+
+    api = API["common"]["vote"]["info"]["get_info"]
+    params = {
+        "vote_id": vote_id
+    }
+    resp = get(url=api["url"], params=params, cookies=verify.get_cookies())
+    return resp
+
+
+MEDIA_TYPE_MAP = {
+    "audio": 12,
+    "video": 2
+}
+
+
+def get_favorite_list_old(rid: int, up_mid: int, type_: str, pn: int = 1, ps: int = 100, verify: Verify = None):
+    """
+    获取收藏夹列表，旧API
+    :param rid:
+    :param up_mid:
+    :param type_:
+    :param pn:
+    :param ps:
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify = Verify()
+
+    type_ = MEDIA_TYPE_MAP.get(type_, None)
+    if type_ is None:
+        raise BilibiliApiException("不支持的类型")
+
+    api = API["common"]["favorite"]["get_favorite_list_old"]
+    params = {
+        "up_mid": up_mid,
+        "type": type_,
+        "pn": pn,
+        "ps": ps,
+        "rid": rid
+    }
+    resp = get(url=api["url"], params=params, cookies=verify.get_cookies())
+    return resp
+
+
+def get_favorite_list(up_mid: int = None, rid: int = None, type_: str = None, verify: Verify = None):
+    """
+    获取收藏夹列表
+    :param up_mid:
+    :param rid:
+    :param type_:
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify = Verify()
+
+    if rid is not None:
+        if type_ is None:
+            raise BilibiliApiException("请指定type_")
+        type_ = MEDIA_TYPE_MAP.get(type_, None)
+        if type_ is None:
+            raise BilibiliApiException("不支持的类型")
+
+    if up_mid is None:
+        self_info = get_self_info(verify)
+        up_mid = self_info["mid"]
+
+    api = API["common"]["favorite"]["get_favorite_list"]
+    params = {
+        "up_mid": up_mid
+    }
+    if rid is not None:
+        params.update({
+            "type": type_,
+            "rid": rid
+        })
+    resp = get(url=api["url"], params=params, cookies=verify.get_cookies())
+    return resp
+
+
+def operate_favorite(rid: int, type_: str, add_media_ids: list = None,
+                     del_media_ids: list = None, verify: Verify = None):
+    """
+    操作收藏夹
+    :param rid:
+    :param type_:
+    :param add_media_ids: 要添加的收藏夹内容列表
+    :param del_media_ids: 要删除的收藏夹内容列表
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        raise BilibiliApiException("请提供verify")
+    if not verify.has_sess():
+        raise NoPermissionException(MESSAGES["no_sess"])
+    if not verify.has_csrf():
+        raise NoPermissionException(MESSAGES["no_csrf"])
+    if add_media_ids is None:
+        add_media_ids = []
+    if del_media_ids is None:
+        del_media_ids = []
+    if len(add_media_ids) == 0 and len(del_media_ids) == 0:
+        raise BilibiliApiException("add_media_ids和del_media_ids至少提供一个")
+    type_ = MEDIA_TYPE_MAP.get(type_, None)
+    if type_ is None:
+        raise BilibiliApiException("不支持的类型")
+
+    api = API["common"]["favorite"]["operate_favorite"]
+    data = {
+        "rid": rid,
+        "type": type_,
+        "add_media_ids": ",".join([str(i) for i in add_media_ids]),
+        "del_media_ids": ",".join([str(i) for i in del_media_ids]),
+        "csrf": verify.csrf
+    }
+    resp = post(url=api["url"], data=data, cookies=verify.get_cookies())
+    return resp
+
+
+def dynamic_share(type_: str, rid: int, content: str,
+                  title: str = None, cover_url: str = None, target_url: str = None, verify: Verify = None):
+    """
+    分享站内资源到动态
+    :param type_:
+    :param rid:
+    :param content:
+    :param title:
+    :param cover_url:
+    :param target_url:
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        raise BilibiliApiException("请提供verify")
+    if not verify.has_sess():
+        raise NoPermissionException(MESSAGES["no_sess"])
+    if not verify.has_csrf():
+        raise NoPermissionException(MESSAGES["no_csrf"])
+
+    TYPE_MAP = {
+        "video": 8,
+        "article": 64,
+        "audio": 256,
+        "custom": 2048,
+        "bangumi": 4097
+    }
+    type_ = TYPE_MAP.get(type_, None)
+    if type_ is None:
+        raise BilibiliApiException("不支持的分享类型")
+
+    api = API["common"]["dynamic_share"]
+    data = {
+        "type": type_,
+        "content": content,
+        "rid": rid,
+        "csrf": verify.csrf,
+        "csrf_token": verify.csrf,
+        "uid": 0,
+        "share_uid": 0
+    }
+    if type_ == TYPE_MAP["custom"]:
+        # 自定义分享卡片
+        if not all([title, cover_url, target_url]):
+            raise BilibiliApiException("自定义分享卡片需要传入完整参数")
+        else:
+            data.update({
+                "sketch[title]": title,
+                "sketch[biz_type]": 131,
+                "sketch[cover_url]": cover_url,
+                "sketch[target_url]": target_url
+            })
+    resp = post(url=api["url"], cookies=verify.get_cookies(), data=data)
+    return resp
+
+
+def web_search(keyword: str):
+    """
+    只指定关键字在web进行搜索，返回未经处理的字典
+    """
+    api = API["common"]["search"]["web_search"]
+    params = {
+        "keyword": keyword
+    }
+    resp = get(url=api["url"], params=params)
+    return resp
+
+def web_search_by_type(keyword: str, search_type: str):
+    """
+    指定关键字和类型在web进行搜索，返回未经处理的字典
+    类型：视频(video)、番剧(media_bangumi)、影视(media_ft)、直播(live)、专栏(article)、话题(topic)、用户(bili_user)
+    """
+    api = API["common"]["search"]["web_search_by_type"]
+    params = {
+        "keyword": keyword,
+        "search_type": search_type
+    }
+    resp = get(url=api["url"], params=params)
+    return resp
+
+
+#live py
+
+def get_room_play_info(room_display_id: int, stream_config: dict = None, verify: Verify = None):
+    """
+    获取房间信息（真实房间号，封禁情况等）  
+    :param room_display_id: 房间号（展示在URL的房间号）  
+    :param stream_config: 获取流信息，如不需要可以不传。内容比较多，参见文档 模块/live#get_room_play_info
+    :param verify:  
+    :return:
+    """
+    if verify is None:
+        verify = Verify()
+    if stream_config is None:
+        stream_config = {
+            "protocol": 0,
+            "format": 0,
+            "codec": 1,
+            "qn": 10000
+        }
+
+    api = API["live"]["info"]["room_play_info_v2"]
+    params = {
+        "room_id": room_display_id,
+        "platform": "web",
+        "ptype": "16",
+    }
+    if stream_config:
+        params.update(stream_config)
+    resp = get(api["url"], params, cookies=verify.get_cookies())
+    return resp
+
+
+def get_room_play_url(room_real_id: int, verify: Verify = None):
+    """
+    获取获取房间直播流地址
+    :param room_real_id: 房间真实ID
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify = Verify()
+
+    api = API["live"]["info"]["room_play_url"]
+    params = {
+        "cid": room_real_id,
+        "platform": "web",
+        "qn": 10000,
+        "https_url_req": "1",
+        "ptype": "16"
+    }
+    resp = get(api["url"], params, cookies=verify.get_cookies())
+    return resp
+
+
+def get_chat_conf(room_real_id: int, verify: Verify = None):
+    """
+    获取聊天弹幕服务器配置信息(websocket)
+    :param room_real_id: 真实房间号
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify = Verify()
+
+    api = API["live"]["info"]["chat_conf"]
+    resp = get(api["url"], {"room_id": room_real_id}, cookies=verify.get_cookies())
+    return resp
+
+
+def get_room_info(room_real_id: int, verify: Verify = None):
+    """
+    获取直播间信息（标题，简介等）
+    :param room_real_id: 真实房间ID
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify = Verify()
+
+    api = API["live"]["info"]["room_info"]
+    resp = get(api["url"], {"room_id": room_real_id}, cookies=verify.get_cookies())
+    return resp
+
+#user py
+def get_user_info_in_room(room_real_id: int, verify: Verify = None):
+    """
+    获取自己在直播间的信息（粉丝勋章等级，直播用户等级等）
+    :param room_real_id: 真实房间ID
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify = Verify()
+    if not verify.has_sess():
+        raise  NoPermissionException(MESSAGES["no_sess"])
+
+    api = API["live"]["info"]["user_info_in_room"]
+    resp = get(api["url"], {"room_id": room_real_id}, cookies=verify.get_cookies())
+    return resp
+
+
+def get_self_info(verify: Verify = None):
+    """
+    获取直播用户等级等信息
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify = Verify()
+    if not verify.has_sess():
+        raise  NoPermissionException(MESSAGES["no_sess"])
+
+    api = API["live"]["info"]["user_info"]
+    resp = get(api["url"], cookies=verify.get_cookies())
+    return resp
+
+
+def get_black_list(room_real_id: int, limit: int = 114514, callback=None, verify: Verify = None):
+    """
+    获取房间黑名单列表，登录账号需要是该房间房管
+    :param callback: 回调
+    :param limit: 限制数量
+    :param room_real_id: 房间真实ID
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify = Verify()
+    if not verify.has_sess():
+        raise  NoPermissionException(MESSAGES["no_sess"])
+
+    api = API["live"]["info"]["black_list"]
+    users = []
+    count = 0
+    page = 1
+    while count < limit:
+        resp = get(api["url"], {"roomid": room_real_id, "page": page}, cookies=verify.get_cookies())
+        if len(resp) == 0:
+            break
+        if callable(callback):
+            callback(resp)
+        users += resp
+        page += 1
+        count += len(resp)
+    return users[:limit]
+
+
+def get_dahanghai_raw(room_real_id: int, ruid: int, page: int = 1, page_size: int = 29, verify: Verify = None):
+    """
+    低层级API，获取大航海列表
+    :param room_real_id: 房间真实ID
+    :param ruid: room_uid
+    :param page: 页码
+    :param page_size: 保持默认29，每页数量
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify = Verify()
+
+    api = API["live"]["info"]["dahanghai"]
+    params = {
+        "roomid": room_real_id,
+        "ruid": ruid,
+        "page_size": page_size,
+        "page": page
+    }
+    resp = get(api["url"], params, cookies=verify.get_cookies())
+    return resp
+
+
+def get_dahanghai(room_real_id: int, limit: int = 114514, callback=None, verify: Verify = None):
+    """
+    获取大航海列表
+    :param callback: 回调
+    :param limit: 限制数量
+    :param room_real_id: 真实房间ID
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify = Verify()
+
+    ruid = get_room_play_info(room_real_id)["uid"]
+    count = 0
+    users = []
+    page = 1
+    while count < limit:
+        resp = get_dahanghai_raw(room_real_id=room_real_id, ruid=ruid, page=page, verify=verify)
+        if page == 1:
+            if len(resp['top3']) != 0:
+                count += len(resp["top3"])
+                users += resp["top3"]
+        if len(resp["list"]) == 0:
+            break
+        count += len(resp["list"])
+        users += resp["list"]
+        if callable(callback):
+            callback(resp["list"])
+        page += 1
+    return users[:limit]
+
+
+def get_seven_rank(room_real_id: int, verify: Verify = None):
+    """
+    获取七日榜
+    :param room_real_id: 真实房间ID
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify = Verify()
+
+    api = API["live"]["info"]["seven_rank"]
+    ruid = get_room_play_info(room_real_id)["uid"]
+    resp = get(api["url"], {"roomid": room_real_id, "ruid": ruid}, cookies=verify.get_cookies())
+    return resp
+
+
+def get_fans_medal_rank(room_real_id: int, verify: Verify = None):
+    """
+    获取粉丝勋章排行
+    :param room_real_id: 真实房间ID
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify = Verify()
+
+    api = API["live"]["info"]["fans_medal_rank"]
+    ruid = get_room_play_info(room_real_id)["uid"]
+    resp = get(api["url"], {"roomid": room_real_id, "ruid": ruid}, cookies=verify.get_cookies())
+    return resp
+
+
+def send_danmaku(room_real_id: int, danmaku: Danmaku, verify: Verify = None):
+    """
+    直播间发送弹幕
+    :param room_real_id: 真实房间ID
+    :param danmaku: Danmaku
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify = Verify()
+    if not verify.has_sess():
+        raise  NoPermissionException(MESSAGES["no_sess"])
+    if not verify.has_csrf():
+        raise  NoPermissionException(MESSAGES["no_csrf"])
+
+    api = API["live"]["operate"]["send_danmaku"]
+    data = {
+        "mode": danmaku.mode,
+        "msg": danmaku.text,
+        "roomid": room_real_id,
+        "bubble": 0,
+        "csrf": verify.csrf,
+        "csrf_token": verify.csrf,
+        "rnd": int(time.time()),
+        "color": danmaku.color.get_dec_color(),
+        "fontsize": danmaku.font_size
+    }
+    resp = post(url=api["url"], data=data, cookies=verify.get_cookies())
+    return resp
+
+
+def ban_user(room_real_id: int, uid: int, hour: int = 1, verify: Verify = None):
+    """
+    封禁用户
+    :param hour: 封禁时长，小时
+    :param uid: 用户UID
+    :param room_real_id: 真实房间ID
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify = Verify()
+    if not verify.has_sess():
+        raise  NoPermissionException(MESSAGES["no_sess"])
+    if not verify.has_csrf():
+        raise  NoPermissionException(MESSAGES["no_csrf"])
+
+    api = API["live"]["operate"]["add_block"]
+    data = {
+        "roomid": room_real_id,
+        "block_uid": uid,
+        "hour": hour,
+        "csrf": verify.csrf,
+        "csrf_token": verify.csrf,
+        "visit_id": ""
+    }
+    resp = post(url=api["url"], data=data, cookies=verify.get_cookies())
+    return resp
+
+
+def unban_user(room_real_id: int, block_id: int, verify: Verify = None):
+    """
+    解封
+    :param block_id: 封禁ID，从live.info.black_list中获取或者live.operate.add_black的返回值获取
+    :param room_real_id: 真实房间ID
+    :param verify:
+    :return:
+    """
+    if verify is None:
+        verify = Verify()
+    if not verify.has_sess():
+        raise  NoPermissionException(MESSAGES["no_sess"])
+    if not verify.has_csrf():
+        raise  NoPermissionException(MESSAGES["no_csrf"])
+
+    api = API["live"]["operate"]["del_block"]
+    data = {
+        "roomid": room_real_id,
+        "id": block_id,
+        "visit_id": "",
+        "csrf": verify.csrf,
+        "csrf_token": verify.csrf
+    }
+    resp = post(url=api["url"], data=data, cookies=verify.get_cookies())
+    return resp
+
+
+def connect_all_LiveDanmaku(*livedanmaku_classes):
+    """
+    简单同时连接多个直播间，一般建议自行处理事件循环来进行更精准的控制
+
+    使用 `room.connect(True)` 可以返回一个 Coroutine，将这个安排进事件循环即可连接到房间
+
+    :param livedanmaku_classes: LiveDanmaku类动态参数
+    :return: 如果 loop 正在运行，则会返回 Task 对象且不会阻塞。如果没有运行，则会启动 loop 并阻塞，无返回。
+    """
+
+    async def run():
+        tasks = []
+        for room in livedanmaku_classes:
+            task = asyncio.create_task(room.connect(True))
+            tasks.append(task)
+        await asyncio.gather(*tasks)
+
+    if asyncio.get_event_loop().is_running():
+        return asyncio.create_task(run())
+    else:
+        asyncio.run(run())
+        return None
+
+
+class LiveDanmaku(object):
+    """
+    Websocket实时获取直播弹幕
+    """
+    PROTOCOL_VERSION_RAW_JSON = 0
+    PROTOCOL_VERSION_HEARTBEAT = 1
+    PROTOCOL_VERSION_ZLIB_JSON = 2
+
+    DATAPACK_TYPE_HEARTBEAT = 2
+    DATAPACK_TYPE_HEARTBEAT_RESPONSE = 3
+    DATAPACK_TYPE_NOTICE = 5
+    DATAPACK_TYPE_VERIFY = 7
+    DATAPACK_TYPE_VERIFY_SUCCESS_RESPONSE = 8
+
+    def __init__(self, room_display_id: int, debug: bool = False, use_wss: bool = True, should_reconnect: bool = True
+                 , verify: Verify = None):
+        self.verify = verify
+        self.room_real_id = room_display_id
+        self.room_display_id = room_display_id
+        self.__use_wss = use_wss
+        self.__event_loop = asyncio.get_event_loop()
+        # logging
+        self.logger = logging.getLogger(f"LiveDanmaku_{self.room_display_id}")
+        self.logger.setLevel(logging.DEBUG if debug else logging.INFO)
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("[" + str(room_display_id) + "][%(asctime)s][%(levelname)s] %(message)s"))
+        self.logger.addHandler(handler)
+
+        self.__event_handlers = {}
+        self.__websocket = None
+        # 连接状态，0未连接，1已连接，3已正常断开，-1异常断开
+        self.__connected_status = 0
+        self.__conf = None
+
+        # 重连设置
+        self.should_reconnect = should_reconnect
+
+        self.__heartbeat_task = None
+        self.__is_single_room = False
+
+    def connect(self, return_coroutine: bool = False):
+        """
+        连接直播间
+        :param return_coroutine: 是否返回房间入口的 Coroutine 而不是直接连接单个房间。用以自行进行更精准的异步控制。
+        :return:
+        """
+        if self.__connected_status == 1:
+            raise  LiveException("已连接直播间，不可重复连接")
+        if return_coroutine:
+            self.__is_single_room = False
+            return self.__main()
+        else:
+            self.__is_single_room = True
+            asyncio.get_event_loop().run_until_complete(self.__main())
+
+    def disconnect(self):
+        """
+        断开连接
+        :return:
+        """
+        self.__connected_status = 2
+        asyncio.gather(self.__ws.close())
+
+    def get_connect_status(self):
+        return self.__connected_status
+
+    async def __main(self):
+        """
+        入口
+        :return:
+        """
+        # 获取真实房间号
+        self.logger.debug("正在获取真实房间号")
+        self.room_real_id = get_room_play_info(room_display_id=self.room_real_id, verify=self.verify)["room_id"]
+        self.logger.debug(f"获取成功，真实房间号：{self.room_real_id}")
+        # 获取直播服务器配置
+        self.logger.debug("正在获取聊天服务器配置")
+        self.__conf = get_chat_conf(room_real_id=self.room_real_id, verify=self.verify)
+        self.logger.debug("聊天服务器配置获取成功")
+        # 连接直播间
+        self.logger.debug("准备连接直播间")
+        for host in self.__conf["host_server_list"]:
+            port = host['wss_port'] if self.__use_wss else host['ws_port']
+            protocol = "wss" if self.__use_wss else "ws"
+            uri = f"{protocol}://{host['host']}:{port}/sub"
+            self.logger.debug(f"正在尝试连接主机： {uri}")
+            try:
+                while True:
+                    async with websockets.connect(uri) as ws:
+                        self.__ws = ws
+                        
+                        self.logger.debug(f"连接主机成功, 准备发送认证信息")
+                        uid = None
+                        if self.verify is not None:
+                            if self.verify.has_sess():
+                                self.logger.debug("检测到传入Verify，正在获取用户UID")
+                                self_info = get_self_info(self.verify)
+                                uid = self_info["mid"]
+                                self.logger.debug(f"用户UID为{uid}")
+                        verifyData = {"uid": 0 if uid is None else uid, "roomid": self.room_real_id,
+                                      "protover": 2, "platform": "web",
+                                      "clientver": "1.17.0", "type": 2, "key": self.__conf["token"]}
+                        data = json.dumps(verifyData).encode()
+                        await self.__send(data, LiveDanmaku.PROTOCOL_VERSION_HEARTBEAT, LiveDanmaku.DATAPACK_TYPE_VERIFY)
+                        self.__connected_status = 1
+                        await self.__loop()
+                        if self.__connected_status >= 0:
+                            return
+                        if not self.should_reconnect:
+                            return
+            except websockets.ConnectionClosedError:
+                self.logger.warning(f"连接失败，准备尝试下一个地址")
+        else:
+            self.__connected_status = -1
+            self.logger.error(f"所有主机连接失败，程序终止")
+
+    async def __loop(self):
+        """
+        循环收取数据
+        :return:
+        """
+        heartbeat_task = asyncio.create_task(self.__heartbeat())
+        self.__heartbeat_task = heartbeat_task
+        while True:
+            try:
+                data = await self.__recv()
+            except websockets.ConnectionClosed:
+                callback_info = {
+                    'room_display_id': self.room_display_id,
+                    'room_real_id': self.room_real_id,
+                    "type": "DISCONNECT",
+                    "data": self.__connected_status
+                }
+                handlers = self.__event_handlers.get("DISCONNECT", []) + self.__event_handlers.get("ALL", [])
+                for handler in handlers:
+                    asyncio.create_task(self.__run_as_asynchronous_func(handler, callback_info))
+                if self.__connected_status == 2:
+                    self.logger.info("连接正常断开")
+                    return
+                else:
+                    self.__connected_status = -1
+                    self.logger.warning("连接被异常断开")
+                if self.__heartbeat_task is not None:
+                    self.__heartbeat_task.cancel()
+                break
+            self.logger.debug(f"收到信息：{data}")
+            for info in data:
+                callback_info = {
+                    'room_display_id': self.room_display_id,
+                    'room_real_id': self.room_real_id
+                }
+                # 依次处理并调用用户指定函数
+                if info["datapack_type"] == LiveDanmaku.DATAPACK_TYPE_VERIFY_SUCCESS_RESPONSE:
+                    # 认证反馈
+                    if info["data"]["code"] == 0:
+                        # 认证成功反馈
+                        self.logger.info("连接服务器并认证成功")
+                    else:
+                        # 认证失败（实际上直接断开了）
+                        self.logger.error("连接服务器成功但认证失败")
+                elif info["datapack_type"] == LiveDanmaku.DATAPACK_TYPE_HEARTBEAT_RESPONSE:
+                    # 心跳包反馈，返回直播间人气
+                    self.logger.debug("收到心跳包反馈")
+                    callback_info["type"] = 'VIEW'
+                    callback_info["data"] = info["data"]["view"]
+                    handlers = self.__event_handlers.get("VIEW", []) + self.__event_handlers.get("ALL", [])
+                    for handler in handlers:
+                        asyncio.create_task(self.__run_as_asynchronous_func(handler, callback_info))
+                elif info["datapack_type"] == LiveDanmaku.DATAPACK_TYPE_NOTICE:
+                    # 直播间弹幕、礼物等信息
+                    callback_info["type"] = info["data"]["cmd"]
+                    callback_info["data"] = info["data"]
+                    #print(info["data"]["info"])
+                    handlers = self.__event_handlers.get(info["data"]["cmd"], []) + self.__event_handlers.get("ALL", [])
+                    for handler in handlers:
+                        asyncio.create_task(self.__run_as_asynchronous_func(handler, callback_info))
+                else:
+                    self.logger.warning("检测到未知的数据包类型，无法处理")
+
+    async def __heartbeat(self):
+        """
+        定时发送心跳包
+        :return:
+        """
+        HEARTBEAT = base64.b64decode("AAAAHwAQAAEAAAACAAAAAVtvYmplY3QgT2JqZWN0XQ==")
+        while self.__connected_status == 1:
+            self.logger.debug("发送心跳包")
+            await self.__ws.send(HEARTBEAT)
+            await asyncio.sleep(30.0)
+
+    async def __send(self, data: bytes, protocol_version: int, datapack_type: int):
+        """
+        自动打包并发送数据
+        :param data: 待发送的二进制数据
+        :param protocol_version: 数据包协议版本
+        :param datapack_type: 数据包类型
+        :return:
+        """
+        data = self.__pack(data, protocol_version, datapack_type)
+        await self.__ws.send(data)
+
+    async def __recv(self):
+        """
+        接收数据并自动解包
+        :return:
+        """
+        raw_data = await self.__ws.recv()
+        data = self.__unpack(raw_data)
+        return data
+
+    @classmethod
+    def __pack(cls, data: bytes, protocol_version: int, datapack_type: int):
+        """
+        打包数据
+        :param data: 待发送的二进制数据
+        :param protocol_version: 数据包协议版本
+        :param datapack_type: 数据包类型
+        :return:
+        """
+        sendData = bytearray()
+        sendData += struct.pack(">H", 16)
+        assert 0 <= protocol_version <= 2,  LiveException("数据包协议版本错误，范围0~2")
+        sendData += struct.pack(">H", protocol_version)
+        assert datapack_type in [2, 7],  LiveException("数据包类型错误，可用类型：2, 7")
+        sendData += struct.pack(">I", datapack_type)
+        sendData += struct.pack(">I", 1)
+        sendData += data
+        sendData = struct.pack(">I", len(sendData) + 4) + sendData
+        return bytes(sendData)
+
+    @classmethod
+    def __unpack(cls, data: bytes):
+        """
+        解包数据
+        :param data: 服务器传来的原始数据
+        :return:
+        """
+        ret = []
+        offset = 0
+        header = struct.unpack(">IHHII", data[:16])
+        if header[2] == 2:
+            realData = zlib.decompress(data[16:])
+        else:
+            realData = data
+
+        while offset < len(realData):
+            header = struct.unpack(">IHHII", realData[offset:offset + 16])
+            length = header[0]
+            recvData = {
+                "protocol_version": header[2],
+                "datapack_type": header[3],
+                "data": None
+            }
+
+            chunkData = realData[(offset + 16):(offset + length)]
+            if header[2] == 0:
+                recvData["data"] = json.loads(chunkData.decode("utf8"))
+                if "data" in recvData["data"]:
+                    datas=recvData["data"].get("data","no exist")#dic
+                    datas=json.dumps(datas,ensure_ascii=False)
+                    client.send(bytes(datas,encoding='utf8'))
+                    #print(recvData)
+
+
+
+
+                    #"giftName","face"
+                #recvdatas = recvData["data"]["data"]
+                #print(recvdatas)
+
+            elif header[2] == 2:
+                recvData["data"] = json.loads(chunkData.decode("utf8"))
+            elif header[2] == 1:
+                if header[3] == cls.DATAPACK_TYPE_HEARTBEAT_RESPONSE:
+                    recvData["data"] = {"view": struct.unpack(">I", chunkData)[0]}
+                elif header[3] == cls.DATAPACK_TYPE_VERIFY_SUCCESS_RESPONSE:
+                    recvData["data"] = json.loads(chunkData.decode("utf8"))
+            ret.append(recvData)
+            offset += length
+
+        return ret
+
+    @staticmethod
+    async def __run_as_asynchronous_func(func, *args):
+        """
+        区分同步和异步执行函数
+        :param func: 回调函数，非异步函数
+        :param *args: 传递给函数的参数
+        :return:
+        """
+        if asyncio.iscoroutinefunction(func):
+            await func(*args)
+        else:
+            func(*args)
+
+    def add_event_handler(self, event_name: str, func):
+        """
+        为当前直播弹幕增加事件回调
+        :param event_name: 事件名
+        :param func: 回调函数
+        :return:
+        """
+        if not callable(func):
+            raise  LiveException("回调函数请传入方法")
+        upper_name = event_name.upper()
+        if upper_name not in self.__event_handlers:
+            self.__event_handlers[upper_name] = []
+        self.__event_handlers[upper_name].append(func)
+
+    def on(self, name: str):
+        """
+        使用@语法，触发事件时会被调用
+        :param name: 事件名
+        :return:
+        """
+        """
+        直播区更新速度快，以实际API为准，可以开debug自己看
+        常见事件名：
+        DANMU_MSG: 用户发送弹幕
+        SEND_GIFT: 礼物
+        COMBO_SEND：礼物连击
+        GUARD_BUY：续费大航海
+        SUPER_CHAT_MESSAGE：醒目留言（SC）
+        SUPER_CHAT_MESSAGE_JPN：醒目留言（带日语翻译？）
+        WELCOME: 老爷进入房间
+        WELCOME_GUARD: 房管进入房间
+        NOTICE_MSG: 系统通知（全频道广播之类的）
+        PREPARING: 直播准备中
+        LIVE: 直播开始
+        ROOM_REAL_TIME_MESSAGE_UPDATE: 粉丝数等更新
+        ENTRY_EFFECT: 进场特效
+        ROOM_RANK: 房间排名更新
+        INTERACT_WORD: 用户进入直播间
+        ACTIVITY_BANNER_UPDATE_V2: 好像是房间名旁边那个xx小时榜
+        本模块自定义事件：
+        VIEW: 直播间人气更新
+        ALL: 所有事件
+        DISCONNECT: 断开连接（传入连接状态码参数）
+        """
+        def decoration(func):
+            upper_name = name.upper()
+            if upper_name not in self.__event_handlers:
+                self.__event_handlers[upper_name] = []
+            self.__event_handlers[upper_name].append(func)
+
+            @functools.wraps(func)
+            def wrapper(*args, **kwargs):
+                func(*args, **kwargs)
+            return wrapper
+        return decoration
+
+def GetConfigInit():
+    cf=configparser.ConfigParser()
+    configDir=os.path.dirname(os.path.realpath(__file__))
+    print(configDir)
+    configDir=configDir+'/config.ini'
+    cf.read(configDir)
+    secf=cf.sections()
+    bilibili= int(cf.get('bilibili','id'))
+    #bilibili='https://live.bilibili.com/'+bilibili
+    return bilibili
+
+if __name__=="__main__":
+    tcp_server=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+    host='127.0.0.1'
+    port=9950
+    tcp_server.bind((host,port))
+    tcp_server.listen(10)
+    userid=GetConfigInit()#21144080
+    print(type(userid))
+    print(userid)
+    while True:
+        try:
+            client,addr=tcp_server.accept()
+            print(addr,"连接上了")
+            danmu=LiveDanmaku(room_display_id=userid,should_reconnect=True,debug=False)#2336
+            danmu.connect()
+        except:
+            client.close()
+
+
+
+
+
