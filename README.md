@@ -1,3 +1,5 @@
+##Bilibili_User_info.py 和Main_Run.py都是独立的模块，可以单独运行，没有任何依赖关系
+
 # Bilibili_live_Danmaku
 Get Bilibili live Danmaku and send message for TCP  
 [env]  
